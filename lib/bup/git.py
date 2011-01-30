@@ -6,7 +6,10 @@ import os, sys, zlib, time, subprocess, struct, stat, re, tempfile
 from bup.helpers import *
 from bup import _helpers, path
 
-MIDX_VERSION = 2
+MIDX_VERSION = 3
+
+PRE_BYTES = 6
+POST_BYTES = 20 - PRE_BYTES
 
 verbose = 0
 ignore_midx = 0
@@ -18,6 +21,7 @@ _typermap = { 3:'blob', 2:'tree', 1:'commit', 4:'tag' }
 
 _total_searches = 0
 _total_steps = 0
+_rare_warned = 0
 
 
 class GitError(Exception):
@@ -267,13 +271,15 @@ class PackMidx:
             self.force_keep = True  # new stuff is exciting
             return self._init_failed()
 
-        self.bits = _helpers.firstword(self.map[8:12])
-        self.entries = 2**self.bits
-        self.fanout = buffer(self.map, 12, self.entries*4)
-        shaofs = 12 + self.entries*4
-        nsha = self._fanget(self.entries-1)
-        self.shalist = buffer(self.map, shaofs, nsha*20)
-        self.idxnames = str(self.map[shaofs + 20*nsha:]).split('\0')
+            self.bits = _helpers.firstword(self.map[8:12])
+            self.entries = 2**self.bits
+            self.fanout = buffer(self.map, 12, self.entries*4)
+            shaofs = 12 + self.entries*4
+            self.nsha = nsha = self._fanget(self.entries-1)
+            self.prelist = buffer(self.map, shaofs, nsha*PRE_BYTES)
+            self.postlist = buffer(self.map, shaofs + nsha*PRE_BYTES,
+                                   nsha*POST_BYTES)
+            self.idxnames = str(self.map[shaofs + 24*nsha:]).split('\0')
 
     def _init_failed(self):
         self.bits = 0
@@ -288,13 +294,44 @@ class PackMidx:
         return _helpers.firstword(s)
 
     def _get(self, i):
-        return str(self.shalist[i*20:(i+1)*20])
+        return str(self.prelist[i*PRE_BYTES:(i+1)*PRE_BYTES])
+
+    def _get_post(self, i):
+        return str(self.postlist[i*POST_BYTES:(i+1)*POST_BYTES])
+
+    def _exists_verify(self, hash, i):
+        global _total_steps, _rare_warned
+        pre = str(hash[:PRE_BYTES])
+        post = str(hash[PRE_BYTES:])
+        #print 'starting: %d (want %s)' % (i, hash.encode('hex'))
+        while i > 0:
+            _total_steps += 1
+            if self._get(i-1) == pre:
+                i -= 1
+            else:
+                break
+        #print '  now %d' % i
+        for i in xrange(i, self.nsha):
+            _total_steps += 1
+            #print '  testing %d (%s-%s)' % (i, self._get(i).encode('hex'),
+            #                                self._get_post(i).encode('hex'))
+            if self._get(i) != pre:
+                break
+            if self._get_post(i) == post:
+                return True
+        _rare_warned += 1
+        if _rare_warned <= 5:
+            log('Warning: rare: sha1 prefix %r collision.  Please report.\n'
+                % pre.encode('hex'))
+        if _rare_warned == 5:
+            log('Warning: not printing any more collision warnings.\n')
+        return False
 
     def exists(self, hash):
         """Return nonempty if the object exists in the index files."""
         global _total_searches, _total_steps
         _total_searches += 1
-        want = str(hash)
+        want = str(hash)[:PRE_BYTES]
         el = extract_bits(want, self.bits)
         if el:
             start = self._fanget(el-1)
@@ -313,7 +350,7 @@ class PackMidx:
             mid = start + (hashv-startv)*(end-start-1)/(endv-startv)
             #print '  %08x %08x %08x   %d %d %d' % (startv, hashv, endv, start, mid, end)
             v = self._get(mid)
-            #print '    %08x' % self._num(v)
+            #print '    %08x' % _helpers.firstword(v)
             if v < want:
                 start = mid+1
                 startv = _helpers.firstword(v)
@@ -321,12 +358,13 @@ class PackMidx:
                 end = mid
                 endv = _helpers.firstword(v)
             else: # got it!
-                return True
+                return self._exists_verify(hash, mid)
         return None
 
     def __iter__(self):
         for i in xrange(self._fanget(self.entries-1)):
-            yield buffer(self.shalist, i*20, 20)
+            yield (str(self.prelist[i*PRE_BYTES:(i+1)*PRE_BYTES]) +
+                   str(self.postlist[i*POST_BYTES:(i+1)*POST_BYTES]))
 
     def __len__(self):
         return int(self._fanget(self.entries-1))
@@ -571,7 +609,7 @@ class PackWriter:
         return sha
 
     def breakpoint(self):
-        """Clear byte and object counts and return the last processed id."""
+        """End the current pack and start a new one."""
         id = self._end()
         self.outbytes = self.count = 0
         return id

@@ -155,9 +155,11 @@ class PackIdx:
             return self._ofs_from_idx(idx)
         return None
 
-    def exists(self, hash):
-        """Return nonempty if the object exists in this index."""
-        return hash and (self._idx_from_hash(hash) != None) and True or None
+    def exists(self, hash, want_idxname=False):
+        """Return nonempty if the object exists in this index else None."""
+        if hash and (self._idx_from_hash(hash) != None):
+            return want_idxname and self.name or True
+        return None
 
     def __len__(self):
         return int(self.fanout[255])
@@ -204,7 +206,7 @@ class PackIdxV1(PackIdx):
 
     def __iter__(self):
         for i in xrange(self.fanout[255]):
-            yield buffer(self.map, 256*4 + 24*i + 4, 20)
+            yield buffer(self.map, 256*4 + 24*i + 4, 20), self.name
 
 
 class PackIdxV2(PackIdx):
@@ -238,7 +240,7 @@ class PackIdxV2(PackIdx):
 
     def __iter__(self):
         for i in xrange(self.fanout[255]):
-            yield buffer(self.map, 8 + 256*4 + 20*i, 20)
+            yield buffer(self.map, 8 + 256*4 + 20*i, 20), self.name
 
 
 extract_bits = _helpers.extract_bits
@@ -271,15 +273,17 @@ class PackMidx:
             self.force_keep = True  # new stuff is exciting
             return self._init_failed()
 
-            self.bits = _helpers.firstword(self.map[8:12])
-            self.entries = 2**self.bits
-            self.fanout = buffer(self.map, 12, self.entries*4)
-            shaofs = 12 + self.entries*4
-            self.nsha = nsha = self._fanget(self.entries-1)
-            self.prelist = buffer(self.map, shaofs, nsha*PRE_BYTES)
-            self.postlist = buffer(self.map, shaofs + nsha*PRE_BYTES,
-                                   nsha*POST_BYTES)
-            self.idxnames = str(self.map[shaofs + 24*nsha:]).split('\0')
+        self.bits = _helpers.firstword(self.map[8:12])
+        self.entries = 2**self.bits
+        self.fanout = buffer(self.map, 12, self.entries*4)
+        shaofs = 12 + self.entries*4
+        self.nsha = nsha = self._fanget(self.entries-1)
+        self.prelist = buffer(self.map, shaofs, nsha*PRE_BYTES)
+        self.postlist = buffer(self.map, shaofs + nsha*PRE_BYTES,
+                               nsha*POST_BYTES)
+        self.whichlist = buffer(self.map, shaofs + nsha*(PRE_BYTES+POST_BYTES),
+                                nsha*4)
+        self.idxnames = str(self.map[shaofs + 24*nsha:]).split('\0')
 
     def _init_failed(self):
         self.bits = 0
@@ -299,7 +303,11 @@ class PackMidx:
     def _get_post(self, i):
         return str(self.postlist[i*POST_BYTES:(i+1)*POST_BYTES])
 
-    def _exists_verify(self, hash, i):
+    def _get_idxname(self, i):
+        idx_i = struct.unpack('!I', self.whichlist[i*4:(i+1)*4])[0]
+        return self.idxnames[idx_i]
+
+    def _exists_verify(self, hash, i, want_idxname=False):
         global _total_steps, _rare_warned
         pre = str(hash[:PRE_BYTES])
         post = str(hash[PRE_BYTES:])
@@ -318,7 +326,7 @@ class PackMidx:
             if self._get(i) != pre:
                 break
             if self._get_post(i) == post:
-                return True
+                return want_idxname and self._get_idxname(i) or True
         _rare_warned += 1
         if _rare_warned <= 5:
             log('Warning: rare: sha1 prefix %r collision.  Please report.\n'
@@ -327,8 +335,9 @@ class PackMidx:
             log('Warning: not printing any more collision warnings.\n')
         return False
 
-    def exists(self, hash):
-        """Return nonempty if the object exists in the index files."""
+    def exists(self, hash, want_idxname=False):
+        """Return nonempty if the object exists in the index files.
+           Return the source idx file name if want_idxname."""
         global _total_searches, _total_steps
         _total_searches += 1
         want = str(hash)[:PRE_BYTES]
@@ -358,13 +367,15 @@ class PackMidx:
                 end = mid
                 endv = _helpers.firstword(v)
             else: # got it!
-                return self._exists_verify(hash, mid)
+                return self._exists_verify(hash, mid, want_idxname)
         return None
 
     def __iter__(self):
         for i in xrange(self._fanget(self.entries-1)):
+            idx = self._get_idxname(i)
             yield (str(self.prelist[i*PRE_BYTES:(i+1)*PRE_BYTES]) +
-                   str(self.postlist[i*POST_BYTES:(i+1)*POST_BYTES]))
+                   str(self.postlist[i*POST_BYTES:(i+1)*POST_BYTES])), idx
+                  
 
     def __len__(self):
         return int(self._fanget(self.entries-1))
@@ -392,7 +403,7 @@ class PackIdxList:
     def __len__(self):
         return sum(len(pack) for pack in self.packs)
 
-    def exists(self, hash):
+    def exists(self, hash, want_idxname=False):
         """Return nonempty if the object exists in the index files."""
         global _total_searches
         _total_searches += 1
@@ -401,10 +412,11 @@ class PackIdxList:
         for i in range(len(self.packs)):
             p = self.packs[i]
             _total_searches -= 1  # will be incremented by sub-pack
-            if p.exists(hash):
+            ex = p.exists(hash, want_idxname=want_idxname)
+            if ex:
                 # reorder so most recently used packs are searched first
                 self.packs = [p] + self.packs[:i] + self.packs[i+1:]
-                return p.name
+                return ex
         return None
 
     def refresh(self, skip_midx = False):
@@ -473,22 +485,6 @@ class PackIdxList:
             self.packs = list(set(d.values()))
         debug1('PackIdxList: using %d index%s.\n'
             % (len(self.packs), len(self.packs)!=1 and 'es' or ''))
-
-    def packname_containing(self, hash):
-        # figure out which pack contains a given hash.
-        # FIXME: if the midx file format would just *store* this information,
-        # we could calculate it a lot more efficiently.  But it's not needed
-        # often, so let's do it like this.
-        for f in os.listdir(self.dir):
-            if f.endswith('.idx'):
-                full = os.path.join(self.dir, f)
-                try:
-                    ix = open_idx(full)
-                except GitError, e:
-                    add_error(e)
-                    continue
-                if ix.exists(hash):
-                    return full
 
     def add(self, hash):
         """Insert an additional object in the list."""
@@ -625,10 +621,10 @@ class PackWriter:
             raise GitError(
                     "PackWriter not opened or can't check exists w/o objcache")
 
-    def exists(self, id):
+    def exists(self, id, want_idxname=False):
         """Return non-empty if an object is found in the object cache."""
         self._require_objcache()
-        return self.objcache.exists(id)
+        return self.objcache.exists(id, want_idxname=want_idxname)
 
     def maybe_write(self, type, content):
         """Write an object to the pack file if not present and return its id."""

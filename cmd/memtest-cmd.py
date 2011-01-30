@@ -78,7 +78,7 @@ report(0)
 if opt.existing:
     def foreverit(mi):
         while 1:
-            for e in mi:
+            for e,f in mi:
                 yield e
     objit = iter(foreverit(m))
     

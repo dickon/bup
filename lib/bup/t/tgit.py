@@ -80,7 +80,7 @@ def testpacks():
 
     pi = iter(r)
     for h in sorted(hashes):
-        WVPASSEQ(str(pi.next()).encode('hex'), h.encode('hex'))
+        WVPASSEQ(str(pi.next()[0]).encode('hex'), h.encode('hex'))
 
     WVFAIL(r.find_offset('\0'*20))
 

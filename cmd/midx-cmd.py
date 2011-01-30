@@ -33,13 +33,20 @@ def max_files():
     return mf
 
 
-def merge(idxlist, bits, table):
-    count = 0
-    for e in git.idxmerge(idxlist, final_progress=False):
-        count += 1
-        prefix = git.extract_bits(e, bits)
-        table[prefix] = count
-        yield e
+def merge_into(fnmap, ofs, idxlist, bits, fmap, entries):
+    prefix = 0
+    i = 0
+    for i,(e,f) in enumerate(git.idxmerge(idxlist, final_progress=False)):
+        new_prefix = git.extract_bits(e, bits)
+        if new_prefix != prefix:
+            for j in xrange(prefix, new_prefix):
+                yield i
+            prefix = new_prefix
+        fmap[ofs[0] + i*PRE_BYTES : ofs[0] + (i+1)*PRE_BYTES] = e[:PRE_BYTES]
+        fmap[ofs[1] + i*POST_BYTES : ofs[1] + (i+1)*POST_BYTES] = e[PRE_BYTES:]
+        fmap[ofs[2] + i*4 : ofs[2] + (i+1)*4] = struct.pack('!I', fnmap[f])
+    for j in xrange(prefix, entries):
+        yield i+1
 
 
 def _do_midx(outdir, outfilename, infilenames, prefixstr):
@@ -54,7 +61,7 @@ def _do_midx(outdir, outfilename, infilenames, prefixstr):
     for name in infilenames:
         ix = git.open_idx(name)
         for n in ix.idxnames:
-            allfilenames[n] = 1
+            allfilenames[n] = -1
         inp.append(ix)
         total += len(ix)
 
@@ -71,13 +78,11 @@ def _do_midx(outdir, outfilename, infilenames, prefixstr):
     entries = 2**bits
     debug1('midx: table size: %d (%d bits)\n' % (entries*4, bits))
     
-    table = [0]*entries
-
     try:
         os.unlink(outfilename)
     except OSError:
         pass
-    f = open(outfilename + '.tmp', 'w+')
+    f = open(outfilename + '.tmp', 'w+b')
     f.write('MIDX\0\0\0\3')
     f.write(struct.pack('!I', bits))
     assert(f.tell() == 12)
@@ -96,19 +101,21 @@ def _do_midx(outdir, outfilename, infilenames, prefixstr):
 
     f.truncate(ofs_end)
 
-    map = mmap_readwrite(f, ofs_end, close=False)
+    allfilenamestr = ''
+    for i,fn in enumerate(allfilenames.iterkeys()):
+        allfilenames[fn] = i
+        allfilenamestr += '%s\0' % os.path.basename(fn)
+
+    fmap = mmap_readwrite(f, ofs_end, close=False)
     
-    for i,e in enumerate(merge(inp, bits, table)):
-        map[ofs_pre + i*PRE_BYTES : ofs_pre + (i+1)*PRE_BYTES] \
-            = e[:PRE_BYTES]
-        map[ofs_post + i*POST_BYTES : ofs_post + (i+1)*POST_BYTES] \
-            = e[PRE_BYTES:]
-        # FIXME: set the file index block
-    map.flush()
-    map.close()
+    ofs = (ofs_pre, ofs_post, ofs_which)
+    table = tuple(merge_into(allfilenames, ofs, inp, bits, fmap, entries))
+        
+    fmap.flush()
+    fmap.close()
 
     f.seek(ofs_end)
-    f.write('\0'.join(os.path.basename(p) for p in allfilenames.keys()))
+    f.write(allfilenamestr)
 
     f.seek(12)
     f.write(struct.pack('!%dI' % entries, *table))

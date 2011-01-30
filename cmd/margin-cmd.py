@@ -25,7 +25,7 @@ mi = git.PackIdxList(git.repo('objects/pack'))
 def do_predict(ix):
     total = len(ix)
     maxdiff = 0
-    for count,i in enumerate(ix):
+    for count,(i,f) in enumerate(ix):
         prefix = struct.unpack('!Q', i[:8])[0]
         expected = prefix * total / (1<<64)
         diff = count - expected
@@ -45,7 +45,7 @@ else:
     # default mode: find longest matching prefix
     last = '\0'*20
     longmatch = 0
-    for i in mi:
+    for i,f in mi:
         if i == last:
             continue
         #assert(str(i) >= last)

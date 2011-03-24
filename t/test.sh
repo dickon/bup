@@ -235,6 +235,12 @@ WVPASS bup restore -C buprestore.tmp "/master/latest/$TOP/$D/"
 touch $D/non-existent-file buprestore.tmp/non-existent-file # else diff fails
 WVPASS diff -ur $D/ buprestore.tmp/
 
+WVSTART "cycle-check"
+mkdir -p /tmp/buptest/tmp
+WVPASS bup index /tmp/buptest
+WVPASS bup save -n cycle-check /tmp/buptest
+WVPASS bup restore -C buprestore.tmp cycle-check/latest/tmp/buptest
+
 WVSTART "ftp"
 WVPASS bup ftp "cat /master/latest/$TOP/$D/b" >$D/b.new
 WVPASS bup ftp "cat /master/latest/$TOP/$D/f" >$D/f.new
